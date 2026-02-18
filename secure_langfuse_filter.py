@@ -21,6 +21,17 @@ from pydantic import BaseModel
 from langfuse import Langfuse
 
 
+def get_last_assistant_message_obj(messages: list) -> Optional[dict]:
+    """
+    Returns the full message dict of the last assistant message,
+    so we can access usage/token metadata attached to it.
+    """
+    for msg in reversed(messages):
+        if msg.get("role") == "assistant":
+            return msg
+    return None
+
+
 class Pipeline:
     class Valves(BaseModel):
         pipelines: List[str] = []
@@ -262,13 +273,10 @@ class Pipeline:
         metadata = body.get("metadata", {})
         chat_id = metadata.get("chat_id", str(uuid.uuid4()))
 
-        # Handle temporary chats
+        # Handle temporary chats (use modified chat_id only for Langfuse, never write back)
         if chat_id == "local":
             session_id = metadata.get("session_id")
             chat_id = f"temporary-session-{session_id}"
-
-        metadata["chat_id"] = chat_id
-        body["metadata"] = metadata
 
         # Extract and store both model name and ID if available
         model_info = metadata.get("model", {})
@@ -301,7 +309,10 @@ class Pipeline:
         tags_list = self._build_tags(task_name)
 
         # Sanitize metadata and body to remove any PII before sending to Langfuse
+        # Work on copies so we never mutate the original body returned to OpenWebUI
         safe_metadata = self._sanitize_metadata(metadata)
+        safe_metadata["type"] = task_name
+        safe_metadata["interface"] = "open-webui"
         safe_body = self._sanitize_body(body)
 
         # Redact message content if redact_content is enabled
@@ -357,10 +368,6 @@ class Pipeline:
                 tags=tags_list if tags_list else None,
                 metadata=trace_metadata,
             )
-
-        # Update metadata with type
-        metadata["type"] = task_name
-        metadata["interface"] = "open-webui"
 
         # Log user input as event
         try:
@@ -455,11 +462,10 @@ class Pipeline:
         # Update the trace with complete output information
         trace = self.chat_traces[chat_id]
         
-        metadata["type"] = task_name
-        metadata["interface"] = "open-webui"
-        
-        # Sanitize metadata to remove any PII
+        # Work on a copy of metadata so we never mutate the original body
         safe_metadata = self._sanitize_metadata(metadata)
+        safe_metadata["type"] = task_name
+        safe_metadata["interface"] = "open-webui"
         
         # Create sanitized trace metadata (no PII), include response time
         complete_trace_metadata = {
