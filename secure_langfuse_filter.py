@@ -12,6 +12,8 @@ from typing import List, Optional
 import os
 import uuid
 import json
+import hashlib
+import time
 
 
 from utils.pipelines.main import get_last_assistant_message
@@ -30,6 +32,9 @@ class Pipeline:
         insert_tags: bool = True
         # New valve that controls whether to use model name instead of model ID for generation
         use_model_name_instead_of_id_for_generation: bool = False
+        # When True, replaces actual message content with metadata summaries
+        # (char count, word count, estimated tokens). No conversation text is sent to Langfuse.
+        redact_content: bool = True
         debug: bool = False
 
     def __init__(self):
@@ -52,6 +57,8 @@ class Pipeline:
         self.suppressed_logs = set()
         # Dictionary to store model names for each chat
         self.model_names = {}
+        # Track inlet timestamps per chat for response-time calculation
+        self.inlet_timestamps = {}
 
     def log(self, message: str, suppress_repeats: bool = False):
         if self.valves.debug:
@@ -130,6 +137,104 @@ class Pipeline:
             self.log(f"Langfuse initialization error: {e}")
             self.langfuse = None
 
+    @staticmethod
+    def _hash_user_id(user_email: Optional[str]) -> Optional[str]:
+        """
+        Returns a SHA-256 hash of the user email to provide a stable,
+        anonymous user identifier that cannot be reversed to the original email.
+        Returns None if no email is provided.
+        """
+        if not user_email:
+            return None
+        return hashlib.sha256(user_email.lower().strip().encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _sanitize_metadata(metadata: dict) -> dict:
+        """
+        Removes any user-identifiable fields from metadata before
+        sending it to Langfuse. Retains only operational fields.
+        """
+        # Fields that could contain PII or allow tracing back to a user
+        pii_keys = {
+            "user", "name", "email", "user_email", "user_name",
+            "profile_image_url", "avatar", "display_name",
+            "user_id",  # raw user_id before hashing
+        }
+        return {k: v for k, v in metadata.items() if k.lower() not in pii_keys}
+
+    @staticmethod
+    def _sanitize_body(body: dict) -> dict:
+        """
+        Returns a copy of the request body safe for logging to Langfuse.
+        Strips top-level user-identifiable fields while keeping messages,
+        model info, and other operational data.
+        """
+        pii_keys = {
+            "user", "user_id", "user_email", "user_name",
+            "name", "email", "profile_image_url", "avatar",
+        }
+        return {k: v for k, v in body.items() if k.lower() not in pii_keys}
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """
+        Rough token estimate: ~4 characters per token for English text.
+        This is a simple heuristic; actual tokenization depends on the model.
+        """
+        if not text:
+            return 0
+        return max(1, len(text) // 4)
+
+    def _redact_text(self, text: str) -> str:
+        """
+        Replaces a text string with a metadata summary.
+        Returns a string like: "[REDACTED | 523 chars | 98 words | ~131 tokens]"
+        """
+        if not text:
+            return "[REDACTED | empty]"
+        char_count = len(text)
+        word_count = len(text.split())
+        token_estimate = self._estimate_tokens(text)
+        return f"[REDACTED | {char_count} chars | {word_count} words | ~{token_estimate} tokens]"
+
+    def _redact_messages(self, messages: list) -> list:
+        """
+        Returns a redacted copy of the messages list.
+        Keeps all metadata (role, images flag, tool_calls structure, etc.)
+        but replaces actual text content with metadata summaries.
+        """
+        if not self.valves.redact_content:
+            return messages
+
+        redacted = []
+        for msg in messages:
+            redacted_msg = {}
+            for key, value in msg.items():
+                if key == "content":
+                    if isinstance(value, str):
+                        redacted_msg[key] = self._redact_text(value)
+                    elif isinstance(value, list):
+                        # Multi-modal content (text + images, etc.)
+                        redacted_parts = []
+                        for part in value:
+                            if isinstance(part, dict):
+                                redacted_part = dict(part)
+                                if part.get("type") == "text" and "text" in part:
+                                    redacted_part["text"] = self._redact_text(part["text"])
+                                elif part.get("type") == "image_url":
+                                    redacted_part["image_url"] = "[REDACTED image]"
+                                redacted_parts.append(redacted_part)
+                            else:
+                                redacted_parts.append(self._redact_text(str(part)))
+                        redacted_msg[key] = redacted_parts
+                    else:
+                        redacted_msg[key] = self._redact_text(str(value))
+                else:
+                    # Keep all non-content fields (role, tool_calls, name, etc.)
+                    redacted_msg[key] = value
+            redacted.append(redacted_msg)
+        return redacted
+
     def _build_tags(self, task_name: str) -> list:
         """
         Builds a list of tags based on valve settings, ensuring we always add
@@ -186,22 +291,33 @@ class Pipeline:
             self.log(error_message)
             raise ValueError(error_message)
 
-        # user_email = user.get("email") if user else None
-        user_email = None
+        # Hash the user email for a stable but anonymous user handle
+        user_email_raw = user.get("email") if user else None
+        hashed_user_id = self._hash_user_id(user_email_raw)
         # Defaulting to 'user_response' if no task is provided
         task_name = metadata.get("task", "user_response")
 
         # Build tags
         tags_list = self._build_tags(task_name)
 
+        # Sanitize metadata and body to remove any PII before sending to Langfuse
+        safe_metadata = self._sanitize_metadata(metadata)
+        safe_body = self._sanitize_body(body)
+
+        # Redact message content if redact_content is enabled
+        if self.valves.redact_content and "messages" in safe_body:
+            safe_body["messages"] = self._redact_messages(safe_body["messages"])
+
+        # Record inlet timestamp for response-time calculation in outlet
+        self.inlet_timestamps[chat_id] = time.time()
+
         if chat_id not in self.chat_traces:
             self.log(f"Creating new trace for chat_id: {chat_id}")
 
             try:
-                # Create trace using Langfuse v3 API with complete data
+                # Create trace using Langfuse v3 API with sanitized data
                 trace_metadata = {
-                    **metadata,
-                    "user_id": user_email,
+                    **safe_metadata,
                     "session_id": chat_id,
                     "interface": "open-webui",
                 }
@@ -209,16 +325,16 @@ class Pipeline:
                 # Create trace with all necessary information
                 trace = self.langfuse.start_span(
                     name=f"chat:{chat_id}",
-                    input=body,
+                    input=safe_body,
                     metadata=trace_metadata
                 )
 
                 # Set additional trace attributes
                 trace.update_trace(
-                    user_id=user_email,
+                    user_id=hashed_user_id,
                     session_id=chat_id,
                     tags=tags_list if tags_list else None,
-                    input=body,
+                    input=safe_body,
                     metadata=trace_metadata,
                 )
 
@@ -230,14 +346,14 @@ class Pipeline:
         else:
             trace = self.chat_traces[chat_id]
             self.log(f"Reusing existing trace for chat_id: {chat_id}")
-            # Update trace with current metadata and tags
+            # Update trace with current sanitized metadata and tags
             trace_metadata = {
-                **metadata,
-                "user_id": user_email,
+                **safe_metadata,
                 "session_id": chat_id,
                 "interface": "open-webui",
             }
             trace.update_trace(
+                user_id=hashed_user_id,
                 tags=tags_list if tags_list else None,
                 metadata=trace_metadata,
             )
@@ -250,20 +366,22 @@ class Pipeline:
         try:
             trace = self.chat_traces[chat_id]
             
-            # Create complete event metadata
+            # Create sanitized event metadata (no PII)
             event_metadata = {
-                **metadata,
+                **safe_metadata,
                 "type": "user_input",
                 "interface": "open-webui",
-                "user_id": user_email,
                 "session_id": chat_id,
                 "event_id": str(uuid.uuid4()),
             }
             
+            # Redact user input messages if enabled
+            event_input = self._redact_messages(body["messages"])
+
             event_span = trace.start_span(
                 name=f"user_input:{str(uuid.uuid4())}",
                 metadata=event_metadata,
-                input=body["messages"],
+                input=event_input,
             )
             event_span.end()
             self.log(f"User input event logged for chat_id: {chat_id}")
@@ -303,8 +421,18 @@ class Pipeline:
 
         self.chat_traces[chat_id]
 
-        assistant_message = get_last_assistant_message(body["messages"])
+        assistant_message_raw = get_last_assistant_message(body["messages"])
         assistant_message_obj = get_last_assistant_message_obj(body["messages"])
+
+        # Redact assistant message if content redaction is enabled
+        if self.valves.redact_content:
+            assistant_message = self._redact_text(assistant_message_raw) if assistant_message_raw else None
+        else:
+            assistant_message = assistant_message_raw
+
+        # Calculate response time from inlet to outlet
+        inlet_ts = self.inlet_timestamps.pop(chat_id, None)
+        response_time_ms = round((time.time() - inlet_ts) * 1000, 1) if inlet_ts else None
 
         usage = None
         if assistant_message_obj:
@@ -320,23 +448,32 @@ class Pipeline:
                     }
                     self.log(f"Usage data extracted: {usage}")
 
+        # Hash user email for anonymous but stable user handle
+        user_email_raw = user.get("email") if user else None
+        hashed_user_id = self._hash_user_id(user_email_raw)
+
         # Update the trace with complete output information
         trace = self.chat_traces[chat_id]
         
         metadata["type"] = task_name
         metadata["interface"] = "open-webui"
         
-        # Create complete trace metadata with all information
+        # Sanitize metadata to remove any PII
+        safe_metadata = self._sanitize_metadata(metadata)
+        
+        # Create sanitized trace metadata (no PII), include response time
         complete_trace_metadata = {
-            **metadata,
-            "user_id": None, #user.get("email") if user else None,
+            **safe_metadata,
             "session_id": chat_id,
             "interface": "open-webui",
             "task": task_name,
         }
+        if response_time_ms is not None:
+            complete_trace_metadata["response_time_ms"] = response_time_ms
         
-        # Update trace with output and complete metadata
+        # Update trace with output and sanitized metadata
         trace.update_trace(
+            user_id=hashed_user_id,
             output=assistant_message,
             metadata=complete_trace_metadata,
             tags=tags_list if tags_list else None,
@@ -354,15 +491,15 @@ class Pipeline:
             else model_id
         )
 
-        # Add both values to metadata regardless of valve setting
-        metadata["model_id"] = model_id
-        metadata["model_name"] = model_name
+        # Add model values to sanitized metadata (these are not PII)
+        safe_metadata["model_id"] = model_id
+        safe_metadata["model_name"] = model_name
 
         # Create LLM generation for the response
         try:
             trace = self.chat_traces[chat_id]
             
-            # Create complete generation metadata
+            # Create sanitized generation metadata (no PII)
             generation_metadata = {
                 **complete_trace_metadata,
                 "type": "llm_response",
@@ -371,10 +508,13 @@ class Pipeline:
                 "generation_id": str(uuid.uuid4()),
             }
             
+            # Redact generation input messages if enabled
+            generation_input = self._redact_messages(body["messages"])
+
             generation = trace.start_generation(
                 name=f"llm_response:{str(uuid.uuid4())}",
                 model=model_value,
-                input=body["messages"],
+                input=generation_input,
                 output=assistant_message,
                 metadata=generation_metadata,
             )
