@@ -11,7 +11,6 @@ requirements: langfuse>=3.0.0
 from typing import List, Optional
 import os
 import uuid
-import json
 import hashlib
 import time
 
@@ -46,7 +45,6 @@ class Pipeline:
         # When True, replaces actual message content with metadata summaries
         # (char count, word count, estimated tokens). No conversation text is sent to Langfuse.
         redact_content: bool = True
-        debug: bool = False
 
     def __init__(self):
         self.type = "filter"
@@ -59,13 +57,11 @@ class Pipeline:
                 "public_key": os.getenv("LANGFUSE_PUBLIC_KEY", "your-public-key-here"),
                 "host": os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com"),
                 "use_model_name_instead_of_id_for_generation": os.getenv("USE_MODEL_NAME", "false").lower() == "true",
-                "debug": os.getenv("DEBUG_MODE", "false").lower() == "true",
             }
         )
 
         self.langfuse = None
         self.chat_traces = {}
-        self.suppressed_logs = set()
         # Dictionary to store model names for each chat
         self.model_names = {}
         # Track inlet timestamps per chat for response-time calculation
@@ -76,29 +72,17 @@ class Pipeline:
         self.chat_last_seen = {}
         self._last_cleanup = 0.0
 
-    def log(self, message: str, suppress_repeats: bool = False):
-        if self.valves.debug:
-            if suppress_repeats:
-                if message in self.suppressed_logs:
-                    return
-                self.suppressed_logs.add(message)
-            print(f"[DEBUG] {message}")
-
     async def on_startup(self):
-        self.log(f"on_startup triggered for {__name__}")
         self.set_langfuse()
 
     async def on_shutdown(self):
-        self.log(f"on_shutdown triggered for {__name__}")
         if self.langfuse:
             try:
-                # End all active traces
                 for chat_id, trace in self.chat_traces.items():
                     try:
                         trace.end()
-                        self.log(f"Ended trace for chat_id: {chat_id}")
-                    except Exception as e:
-                        self.log(f"Failed to end trace for {chat_id}: {e}")
+                    except Exception:
+                        pass
 
                 self.chat_traces.clear()
                 self.model_names.clear()
@@ -106,45 +90,21 @@ class Pipeline:
                 self.chat_enrichments.clear()
                 self.chat_last_seen.clear()
                 self.langfuse.flush()
-                self.log("Langfuse data flushed and state cleared on shutdown")
-            except Exception as e:
-                self.log(f"Failed to flush Langfuse data: {e}")
+            except Exception:
+                pass
 
     async def on_valves_updated(self):
-        self.log("Valves updated, resetting Langfuse client.")
         self.set_langfuse()
 
     def set_langfuse(self):
         try:
-            self.log(f"Initializing Langfuse with host: {self.valves.host}")
-            self.log(
-                f"Secret key set: {'Yes' if self.valves.secret_key and self.valves.secret_key != 'your-secret-key-here' else 'No'}"
-            )
-            self.log(
-                f"Public key set: {'Yes' if self.valves.public_key and self.valves.public_key != 'your-public-key-here' else 'No'}"
-            )
-
-            # Initialize Langfuse client for v3
             self.langfuse = Langfuse(
                 secret_key=self.valves.secret_key,
                 public_key=self.valves.public_key,
                 host=self.valves.host,
-                debug=self.valves.debug,
             )
-
-            # Test authentication
             self.langfuse.auth_check()
-            self.log(
-                f"Langfuse client initialized and authenticated successfully. Connected to host: {self.valves.host}")
-
-        except Exception as e:
-            error_str = str(e).lower()
-            if "401" in str(e) or "unauthorized" in error_str or "credentials" in error_str:
-                self.log(f"Langfuse credentials incorrect: {e}")
-            elif "auth" in error_str:
-                self.log(f"Langfuse auth check failed for host {self.valves.host}: {e}")
-            else:
-                self.log(f"Langfuse initialization error: {e}")
+        except Exception:
             self.langfuse = None
 
     @staticmethod
@@ -205,18 +165,23 @@ class Pipeline:
 
         return sanitized
 
-    @staticmethod
-    def _sanitize_body(body: dict) -> dict:
+    @classmethod
+    def _sanitize_body(cls, body: dict) -> dict:
         """
         Returns a copy of the request body safe for logging to Langfuse.
         Strips top-level user-identifiable fields while keeping messages,
         model info, and other operational data.
+        Also sanitizes the nested metadata dict to remove PII.
         """
         pii_keys = {
             "user", "user_id", "user_email", "user_name",
             "name", "email", "profile_image_url", "avatar",
         }
-        return {k: v for k, v in body.items() if k.lower() not in pii_keys}
+        safe = {k: v for k, v in body.items() if k.lower() not in pii_keys}
+        # Sanitize the nested metadata dict (contains user object with PII)
+        if "metadata" in safe and isinstance(safe["metadata"], dict):
+            safe["metadata"] = cls._sanitize_metadata(safe["metadata"])
+        return safe
 
     @staticmethod
     def _estimate_tokens(text: str) -> int:
@@ -285,12 +250,55 @@ class Pipeline:
         """
         tags_list = []
         if self.valves.insert_tags:
-            # Always add 'open-webui'
             tags_list.append("open-webui")
-            # Add the task_name if it's not one of the excluded defaults
-            if task_name not in ["user_response", "llm_response"]:
+            if task_name not in ("user_response", "llm_response"):
                 tags_list.append(task_name)
         return tags_list
+
+    @staticmethod
+    def _resolve_chat_id(body: dict, from_outlet: bool = False) -> str:
+        """
+        Extract and normalise chat_id from the request body.
+        Inlet reads from metadata, outlet reads from top-level.
+        Temporary chats ("local") are mapped to "temporary-session-<session_id>".
+        """
+        if from_outlet:
+            chat_id = body.get("chat_id")
+            session_id = body.get("session_id")
+        else:
+            metadata = body.get("metadata", {})
+            chat_id = metadata.get("chat_id", str(uuid.uuid4()))
+            session_id = metadata.get("session_id")
+        if chat_id == "local":
+            chat_id = f"temporary-session-{session_id}"
+        return chat_id
+
+    @staticmethod
+    def _get_hashed_user_id(user: Optional[dict]) -> Optional[str]:
+        """Extract user email and return its SHA-256 hash."""
+        email = user.get("email") if user else None
+        return Pipeline._hash_user_id(email)
+
+    def _build_safe_metadata(self, metadata: dict, task_name: str) -> dict:
+        """Sanitise metadata and add standard operational fields."""
+        safe = self._sanitize_metadata(metadata)
+        safe["type"] = task_name
+        safe["interface"] = "open-webui"
+        return safe
+
+    @staticmethod
+    def _extract_usage(assistant_message_obj: Optional[dict]) -> Optional[dict]:
+        """Extract token usage from the assistant message object, if available."""
+        if not assistant_message_obj:
+            return None
+        info = assistant_message_obj.get("usage", {})
+        if not isinstance(info, dict):
+            return None
+        input_tokens = info.get("prompt_eval_count") or info.get("prompt_tokens")
+        output_tokens = info.get("eval_count") or info.get("completion_tokens")
+        if input_tokens is not None and output_tokens is not None:
+            return {"input": input_tokens, "output": output_tokens, "unit": "TOKENS"}
+        return None
 
     def _cleanup_stale_chats(self):
         """
@@ -321,313 +329,173 @@ class Pipeline:
             self.chat_enrichments.pop(cid, None)
             self.chat_last_seen.pop(cid, None)
 
-        if stale_ids:
-            self.log(f"Cleaned up {len(stale_ids)} stale chat(s)")
-            if self.langfuse:
+        if stale_ids and self.langfuse:
                 try:
                     self.langfuse.flush()
                 except Exception:
                     pass
 
     async def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
-        self.log("Langfuse Filter INLET called")
-
-        # Check Langfuse client status
         if not self.langfuse:
-            self.log("[WARNING] Langfuse client not initialized - Skipped")
             return body
 
-        # self.log(f"Inlet function called with body: {body} and user: {user}")
-
         metadata = body.get("metadata", {})
-        chat_id = metadata.get("chat_id", str(uuid.uuid4()))
-
-        # Handle temporary chats (use modified chat_id only for Langfuse, never write back)
-        if chat_id == "local":
-            session_id = metadata.get("session_id")
-            chat_id = f"temporary-session-{session_id}"
+        chat_id = self._resolve_chat_id(body)
 
         # Periodic cleanup of stale chat state to prevent memory leaks
         self._cleanup_stale_chats()
         self.chat_last_seen[chat_id] = time.time()
 
-        # Extract and store both model name and ID if available
+        # Store model information for this chat
         model_info = metadata.get("model", {})
         model_id = body.get("model")
-        
-        # Store model information for this chat
-        if chat_id not in self.model_names:
-            self.model_names[chat_id] = {"id": model_id}
-        else:
-            self.model_names[chat_id]["id"] = model_id
-            
+        self.model_names.setdefault(chat_id, {})["id"] = model_id
         if isinstance(model_info, dict) and "name" in model_info:
             self.model_names[chat_id]["name"] = model_info["name"]
-            # self.log(f"Stored model info - name: '{model_info['name']}', id: '{model_id}' for chat_id: {chat_id}")
 
         required_keys = ["model", "messages"]
         missing_keys = [key for key in required_keys if key not in body]
         if missing_keys:
-            error_message = f"Error: Missing keys in the request body: {', '.join(missing_keys)}"
-            self.log(error_message)
-            raise ValueError(error_message)
+            raise ValueError(f"Error: Missing keys in the request body: {', '.join(missing_keys)}")
 
-        # Hash the user email for a stable but anonymous user handle
-        user_email_raw = user.get("email") if user else None
-        hashed_user_id = self._hash_user_id(user_email_raw)
-        # Defaulting to 'user_response' if no task is provided
+        hashed_user_id = self._get_hashed_user_id(user)
         task_name = metadata.get("task", "user_response")
-
-        # Build tags
         tags_list = self._build_tags(task_name)
 
-        # Sanitize metadata and body to remove any PII before sending to Langfuse
-        # Work on copies so we never mutate the original body returned to OpenWebUI
-        safe_metadata = self._sanitize_metadata(metadata)
-        safe_metadata["type"] = task_name
-        safe_metadata["interface"] = "open-webui"
+        # Sanitize metadata and body — copies so we never mutate original body
+        safe_metadata = self._build_safe_metadata(metadata, task_name)
         safe_body = self._sanitize_body(body)
-
-        # Redact message content if redact_content is enabled
         if self.valves.redact_content and "messages" in safe_body:
             safe_body["messages"] = self._redact_messages(safe_body["messages"])
 
         # Record inlet timestamp for response-time calculation in outlet
         self.inlet_timestamps[chat_id] = time.time()
 
-        if chat_id not in self.chat_traces:
-            self.log(f"Creating new trace for chat_id: {chat_id}")
+        # Build trace metadata once (used for both new and existing traces)
+        trace_metadata = {**safe_metadata, "session_id": chat_id}
 
+        if chat_id not in self.chat_traces:
             try:
-                # Create trace using Langfuse v3 API with sanitized data
-                trace_metadata = {
-                    **safe_metadata,
-                    "session_id": chat_id,
-                    "interface": "open-webui",
-                }
-                
-                # Create trace with all necessary information
                 trace = self.langfuse.start_span(
                     name=f"chat:{chat_id}",
                     input=safe_body,
-                    metadata=trace_metadata
+                    metadata=trace_metadata,
                 )
-
-                # Set additional trace attributes
                 trace.update_trace(
                     user_id=hashed_user_id,
                     session_id=chat_id,
-                    tags=tags_list if tags_list else None,
+                    tags=tags_list or None,
                     input=safe_body,
                     metadata=trace_metadata,
                 )
-
                 self.chat_traces[chat_id] = trace
-                self.log(f"Successfully created trace for chat_id: {chat_id}")
-            except Exception as e:
-                self.log(f"Failed to create trace: {e}")
+            except Exception:
                 return body
         else:
-            trace = self.chat_traces[chat_id]
-            self.log(f"Reusing existing trace for chat_id: {chat_id}")
-            # Update trace with current sanitized metadata and tags
-            trace_metadata = {
-                **safe_metadata,
-                "session_id": chat_id,
-                "interface": "open-webui",
-            }
-            trace.update_trace(
+            self.chat_traces[chat_id].update_trace(
                 user_id=hashed_user_id,
-                tags=tags_list if tags_list else None,
+                tags=tags_list or None,
                 metadata=trace_metadata,
             )
 
-        # Log user input as event
+        # Log user input as a child span
         try:
             trace = self.chat_traces[chat_id]
-            
-            # Create sanitized event metadata (no PII)
-            event_metadata = {
-                **safe_metadata,
-                "type": "user_input",
-                "interface": "open-webui",
-                "session_id": chat_id,
-                "event_id": str(uuid.uuid4()),
-            }
-            
-            # Redact user input messages if enabled
-            event_input = self._redact_messages(body["messages"])
-
             event_span = trace.start_span(
-                name=f"user_input:{str(uuid.uuid4())}",
-                metadata=event_metadata,
-                input=event_input,
+                name=f"user_input:{uuid.uuid4()}",
+                metadata={**safe_metadata, "type": "user_input", "session_id": chat_id},
+                input=safe_body.get("messages", []),
             )
             event_span.end()
-            self.log(f"User input event logged for chat_id: {chat_id}")
-        except Exception as e:
-            self.log(f"Failed to log user input event: {e}")
+        except Exception:
+            pass
 
         return body
 
     async def outlet(self, body: dict, user: Optional[dict] = None) -> dict:
-        self.log("Langfuse Filter OUTLET called")
-
-        # Check Langfuse client status
         if not self.langfuse:
-            self.log("[WARNING] Langfuse client not initialized - Skipped")
             return body
 
-        self.log(f"Outlet function called for chat_id: {body.get('chat_id')}, model: {body.get('model')}, messages: {len(body.get('messages', []))}")
-
-        chat_id = body.get("chat_id")
-
-        # Handle temporary chats
-        if chat_id == "local":
-            session_id = body.get("session_id")
-            chat_id = f"temporary-session-{session_id}"
-
+        chat_id = self._resolve_chat_id(body, from_outlet=True)
         self.chat_last_seen[chat_id] = time.time()
 
         metadata = body.get("metadata", {})
-        # Defaulting to 'llm_response' if no task is provided
         task_name = metadata.get("task", "llm_response")
-
-        # Build tags
         tags_list = self._build_tags(task_name)
 
         if chat_id not in self.chat_traces:
-            self.log(f"[WARNING] No matching trace found for chat_id: {chat_id}, attempting to re-register.")
-            # Re-run inlet to register if somehow missing
             return await self.inlet(body, user)
 
-        assistant_message_raw = get_last_assistant_message(body["messages"])
-        assistant_message_obj = get_last_assistant_message_obj(body["messages"])
+        messages = body["messages"]
+        assistant_message_raw = get_last_assistant_message(messages)
+        assistant_message_obj = get_last_assistant_message_obj(messages)
 
         # Capture title/tags from OpenWebUI task calls for trace enrichment
         if task_name in ("title_generation", "tags_generation") and assistant_message_raw:
-            if chat_id not in self.chat_enrichments:
-                self.chat_enrichments[chat_id] = {}
-            if task_name == "title_generation":
-                self.chat_enrichments[chat_id]["chat_title"] = assistant_message_raw.strip()
-                self.log(f"Captured chat title for chat_id: {chat_id}")
-            elif task_name == "tags_generation":
-                self.chat_enrichments[chat_id]["chat_tags"] = assistant_message_raw.strip()
-                self.log(f"Captured chat tags for chat_id: {chat_id}")
+            enrichment_key = "chat_title" if task_name == "title_generation" else "chat_tags"
+            self.chat_enrichments.setdefault(chat_id, {})[enrichment_key] = assistant_message_raw.strip()
 
         # Redact assistant message if content redaction is enabled
-        if self.valves.redact_content:
-            assistant_message = self._redact_text(assistant_message_raw) if assistant_message_raw else None
-        else:
-            assistant_message = assistant_message_raw
+        assistant_message = (
+            self._redact_text(assistant_message_raw) if self.valves.redact_content and assistant_message_raw
+            else assistant_message_raw
+        )
 
         # Calculate response time from inlet to outlet
         inlet_ts = self.inlet_timestamps.pop(chat_id, None)
         response_time_ms = round((time.time() - inlet_ts) * 1000, 1) if inlet_ts else None
 
-        usage = None
-        if assistant_message_obj:
-            info = assistant_message_obj.get("usage", {})
-            if isinstance(info, dict):
-                input_tokens = info.get("prompt_eval_count") or info.get("prompt_tokens")
-                output_tokens = info.get("eval_count") or info.get("completion_tokens")
-                if input_tokens is not None and output_tokens is not None:
-                    usage = {
-                        "input": input_tokens,
-                        "output": output_tokens,
-                        "unit": "TOKENS",
-                    }
-                    self.log(f"Usage data extracted: {usage}")
+        # Extract token usage
+        usage = self._extract_usage(assistant_message_obj)
 
-        # Hash user email for anonymous but stable user handle
-        user_email_raw = user.get("email") if user else None
-        hashed_user_id = self._hash_user_id(user_email_raw)
+        hashed_user_id = self._get_hashed_user_id(user)
+        safe_metadata = self._build_safe_metadata(metadata, task_name)
 
-        # Update the trace with complete output information
-        trace = self.chat_traces[chat_id]
-        
-        # Work on a copy of metadata so we never mutate the original body
-        safe_metadata = self._sanitize_metadata(metadata)
-        safe_metadata["type"] = task_name
-        safe_metadata["interface"] = "open-webui"
-        
-        # Merge any captured enrichments (title, tags) into trace metadata
+        # Merge enrichments (title, tags) into trace metadata and Langfuse tags
         enrichments = self.chat_enrichments.get(chat_id, {})
+        if enrichments.get("chat_tags"):
+            for tag in enrichments["chat_tags"].split(","):
+                tag = tag.strip()
+                if tag and tag not in tags_list:
+                    tags_list.append(tag)
 
-        # Create sanitized trace metadata (no PII), include response time and enrichments
-        complete_trace_metadata = {
-            **safe_metadata,
-            **enrichments,
-            "session_id": chat_id,
-            "interface": "open-webui",
-            "task": task_name,
-        }
+        trace_name = enrichments.get("chat_title") or f"chat:{chat_id}"
+        complete_metadata = {**safe_metadata, **enrichments, "session_id": chat_id, "task": task_name}
         if response_time_ms is not None:
-            complete_trace_metadata["response_time_ms"] = response_time_ms
-        
+            complete_metadata["response_time_ms"] = response_time_ms
+
         # Update trace with output and sanitized metadata
+        trace = self.chat_traces[chat_id]
         trace.update_trace(
+            name=trace_name,
             user_id=hashed_user_id,
             output=assistant_message,
-            metadata=complete_trace_metadata,
-            tags=tags_list if tags_list else None,
+            metadata=complete_metadata,
+            tags=tags_list or None,
         )
 
-        # Outlet: Always create LLM generation (this is the LLM response)
-        # Determine which model value to use based on the use_model_name valve
+        # Create LLM generation
         model_id = self.model_names.get(chat_id, {}).get("id", body.get("model"))
         model_name = self.model_names.get(chat_id, {}).get("name", "unknown")
+        model_value = model_name if self.valves.use_model_name_instead_of_id_for_generation else model_id
 
-        # Pick primary model identifier based on valve setting
-        model_value = (
-            model_name
-            if self.valves.use_model_name_instead_of_id_for_generation
-            else model_id
-        )
-
-        # Add model values to sanitized metadata (these are not PII)
-        safe_metadata["model_id"] = model_id
-        safe_metadata["model_name"] = model_name
-
-        # Create LLM generation for the response
         try:
-            trace = self.chat_traces[chat_id]
-            
-            # Create sanitized generation metadata (no PII)
-            generation_metadata = {
-                **complete_trace_metadata,
-                "type": "llm_response",
-                "model_id": model_id,
-                "model_name": model_name,
-                "generation_id": str(uuid.uuid4()),
-            }
-            
-            # Redact generation input messages if enabled
-            generation_input = self._redact_messages(body["messages"])
-
             generation = trace.start_generation(
-                name=f"llm_response:{str(uuid.uuid4())}",
+                name=f"llm_response:{uuid.uuid4()}",
                 model=model_value,
-                input=generation_input,
+                input=self._redact_messages(messages),
                 output=assistant_message,
-                metadata=generation_metadata,
+                metadata={**complete_metadata, "model_id": model_id, "model_name": model_name},
             )
-
-            # Update with usage if available
             if usage:
                 generation.update(usage=usage)
-
             generation.end()
-            self.log(f"LLM generation completed for chat_id: {chat_id}")
-        except Exception as e:
-            self.log(f"Failed to create LLM generation: {e}")
+        except Exception:
+            pass
 
-        # Flush data to Langfuse
         try:
-            if self.langfuse:
-                self.langfuse.flush()
-                self.log("Langfuse data flushed")
-        except Exception as e:
-            self.log(f"Failed to flush Langfuse data: {e}")
+            self.langfuse.flush()
+        except Exception:
+            pass
 
         return body
