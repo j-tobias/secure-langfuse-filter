@@ -70,6 +70,11 @@ class Pipeline:
         self.model_names = {}
         # Track inlet timestamps per chat for response-time calculation
         self.inlet_timestamps = {}
+        # Store chat enrichments (title, tags) from OpenWebUI task calls
+        self.chat_enrichments = {}
+        # Track last activity per chat_id for stale entry cleanup
+        self.chat_last_seen = {}
+        self._last_cleanup = 0.0
 
     def log(self, message: str, suppress_repeats: bool = False):
         if self.valves.debug:
@@ -96,8 +101,12 @@ class Pipeline:
                         self.log(f"Failed to end trace for {chat_id}: {e}")
 
                 self.chat_traces.clear()
+                self.model_names.clear()
+                self.inlet_timestamps.clear()
+                self.chat_enrichments.clear()
+                self.chat_last_seen.clear()
                 self.langfuse.flush()
-                self.log("Langfuse data flushed on shutdown")
+                self.log("Langfuse data flushed and state cleared on shutdown")
             except Exception as e:
                 self.log(f"Failed to flush Langfuse data: {e}")
 
@@ -115,7 +124,7 @@ class Pipeline:
                 f"Public key set: {'Yes' if self.valves.public_key and self.valves.public_key != 'your-public-key-here' else 'No'}"
             )
 
-            # Initialize Langfuse client for v3.2.1
+            # Initialize Langfuse client for v3
             self.langfuse = Langfuse(
                 secret_key=self.valves.secret_key,
                 public_key=self.valves.public_key,
@@ -124,28 +133,18 @@ class Pipeline:
             )
 
             # Test authentication
-            try:
-                self.langfuse.auth_check()
-                self.log(
-                    f"Langfuse client initialized and authenticated successfully. Connected to host: {self.valves.host}")
+            self.langfuse.auth_check()
+            self.log(
+                f"Langfuse client initialized and authenticated successfully. Connected to host: {self.valves.host}")
 
-            except Exception as e:
-                self.log(f"Auth check failed: {e}")
-                self.log(f"Failed host: {self.valves.host}")
-                self.langfuse = None
-                return
-
-        except Exception as auth_error:
-            if (
-                "401" in str(auth_error)
-                or "unauthorized" in str(auth_error).lower()
-                or "credentials" in str(auth_error).lower()
-            ):
-                self.log(f"Langfuse credentials incorrect: {auth_error}")
-                self.langfuse = None
-                return
         except Exception as e:
-            self.log(f"Langfuse initialization error: {e}")
+            error_str = str(e).lower()
+            if "401" in str(e) or "unauthorized" in error_str or "credentials" in error_str:
+                self.log(f"Langfuse credentials incorrect: {e}")
+            elif "auth" in error_str:
+                self.log(f"Langfuse auth check failed for host {self.valves.host}: {e}")
+            else:
+                self.log(f"Langfuse initialization error: {e}")
             self.langfuse = None
 
     @staticmethod
@@ -159,19 +158,52 @@ class Pipeline:
             return None
         return hashlib.sha256(user_email.lower().strip().encode("utf-8")).hexdigest()
 
-    @staticmethod
-    def _sanitize_metadata(metadata: dict) -> dict:
+    # Stale chat cleanup settings
+    _CLEANUP_INTERVAL_SECONDS = 300   # Run cleanup every 5 minutes
+    _CHAT_TTL_SECONDS = 86400         # Remove chats inactive for 24 hours
+
+    # Substrings that indicate a variable/key contains PII.
+    # Matched case-insensitively against both top-level metadata keys
+    # and keys inside the nested "variables" dict.
+    _PII_PATTERNS = {
+        "user", "name", "email", "avatar", "location",
+        "profile", "display", "phone", "address", "ip",
+    }
+
+    # Exact top-level metadata keys to strip (fast set lookup)
+    _PII_KEYS = {
+        "user", "name", "email", "user_email", "user_name",
+        "profile_image_url", "avatar", "display_name",
+        "user_id",  # raw user_id before hashing
+    }
+
+    @classmethod
+    def _is_pii_variable(cls, key: str) -> bool:
+        """
+        Returns True if a variable key looks like it contains PII,
+        based on substring matching against known PII patterns.
+        E.g. '{{USER_NAME}}', 'user_email', 'user_location' all match.
+        """
+        lower = key.lower()
+        return any(pattern in lower for pattern in cls._PII_PATTERNS)
+
+    @classmethod
+    def _sanitize_metadata(cls, metadata: dict) -> dict:
         """
         Removes any user-identifiable fields from metadata before
         sending it to Langfuse. Retains only operational fields.
+        Also strips PII keys from the nested 'variables' dict if present.
         """
-        # Fields that could contain PII or allow tracing back to a user
-        pii_keys = {
-            "user", "name", "email", "user_email", "user_name",
-            "profile_image_url", "avatar", "display_name",
-            "user_id",  # raw user_id before hashing
-        }
-        return {k: v for k, v in metadata.items() if k.lower() not in pii_keys}
+        sanitized = {k: v for k, v in metadata.items() if k.lower() not in cls._PII_KEYS}
+
+        # Sanitize the variables sub-dict (OpenWebUI template variables)
+        if "variables" in sanitized and isinstance(sanitized["variables"], dict):
+            sanitized["variables"] = {
+                k: v for k, v in sanitized["variables"].items()
+                if not cls._is_pii_variable(k)
+            }
+
+        return sanitized
 
     @staticmethod
     def _sanitize_body(body: dict) -> dict:
@@ -260,6 +292,43 @@ class Pipeline:
                 tags_list.append(task_name)
         return tags_list
 
+    def _cleanup_stale_chats(self):
+        """
+        Removes chat state older than _CHAT_TTL_SECONDS.
+        Called periodically from inlet() to prevent unbounded memory growth.
+        """
+        now = time.time()
+        if now - self._last_cleanup < self._CLEANUP_INTERVAL_SECONDS:
+            return
+
+        self._last_cleanup = now
+        cutoff = now - self._CHAT_TTL_SECONDS
+        stale_ids = [
+            cid for cid, last_seen in self.chat_last_seen.items()
+            if last_seen < cutoff
+        ]
+
+        for cid in stale_ids:
+            # End and remove stale trace
+            trace = self.chat_traces.pop(cid, None)
+            if trace:
+                try:
+                    trace.end()
+                except Exception:
+                    pass
+            self.model_names.pop(cid, None)
+            self.inlet_timestamps.pop(cid, None)
+            self.chat_enrichments.pop(cid, None)
+            self.chat_last_seen.pop(cid, None)
+
+        if stale_ids:
+            self.log(f"Cleaned up {len(stale_ids)} stale chat(s)")
+            if self.langfuse:
+                try:
+                    self.langfuse.flush()
+                except Exception:
+                    pass
+
     async def inlet(self, body: dict, user: Optional[dict] = None) -> dict:
         self.log("Langfuse Filter INLET called")
 
@@ -277,6 +346,10 @@ class Pipeline:
         if chat_id == "local":
             session_id = metadata.get("session_id")
             chat_id = f"temporary-session-{session_id}"
+
+        # Periodic cleanup of stale chat state to prevent memory leaks
+        self._cleanup_stale_chats()
+        self.chat_last_seen[chat_id] = time.time()
 
         # Extract and store both model name and ID if available
         model_info = metadata.get("model", {})
@@ -405,7 +478,7 @@ class Pipeline:
             self.log("[WARNING] Langfuse client not initialized - Skipped")
             return body
 
-        self.log(f"Outlet function called with body: {body}")
+        self.log(f"Outlet function called for chat_id: {body.get('chat_id')}, model: {body.get('model')}, messages: {len(body.get('messages', []))}")
 
         chat_id = body.get("chat_id")
 
@@ -413,6 +486,8 @@ class Pipeline:
         if chat_id == "local":
             session_id = body.get("session_id")
             chat_id = f"temporary-session-{session_id}"
+
+        self.chat_last_seen[chat_id] = time.time()
 
         metadata = body.get("metadata", {})
         # Defaulting to 'llm_response' if no task is provided
@@ -426,10 +501,19 @@ class Pipeline:
             # Re-run inlet to register if somehow missing
             return await self.inlet(body, user)
 
-        self.chat_traces[chat_id]
-
         assistant_message_raw = get_last_assistant_message(body["messages"])
         assistant_message_obj = get_last_assistant_message_obj(body["messages"])
+
+        # Capture title/tags from OpenWebUI task calls for trace enrichment
+        if task_name in ("title_generation", "tags_generation") and assistant_message_raw:
+            if chat_id not in self.chat_enrichments:
+                self.chat_enrichments[chat_id] = {}
+            if task_name == "title_generation":
+                self.chat_enrichments[chat_id]["chat_title"] = assistant_message_raw.strip()
+                self.log(f"Captured chat title for chat_id: {chat_id}")
+            elif task_name == "tags_generation":
+                self.chat_enrichments[chat_id]["chat_tags"] = assistant_message_raw.strip()
+                self.log(f"Captured chat tags for chat_id: {chat_id}")
 
         # Redact assistant message if content redaction is enabled
         if self.valves.redact_content:
@@ -467,9 +551,13 @@ class Pipeline:
         safe_metadata["type"] = task_name
         safe_metadata["interface"] = "open-webui"
         
-        # Create sanitized trace metadata (no PII), include response time
+        # Merge any captured enrichments (title, tags) into trace metadata
+        enrichments = self.chat_enrichments.get(chat_id, {})
+
+        # Create sanitized trace metadata (no PII), include response time and enrichments
         complete_trace_metadata = {
             **safe_metadata,
+            **enrichments,
             "session_id": chat_id,
             "interface": "open-webui",
             "task": task_name,
