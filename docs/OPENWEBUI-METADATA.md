@@ -209,7 +209,7 @@ Messages in `body["messages"]` follow the OpenAI chat format:
 }
 ```
 
-The filter's `_redact_messages()` replaces all `content` values with size summaries while preserving `role`, `tool_calls`, and other structural fields.
+The filter's `_message_stats()` computes aggregate statistics (message count, roles, character counts) from `content` values without storing any text. Structural fields like `role` and `tool_calls` are never forwarded to Langfuse either.
 
 ---
 
@@ -231,9 +231,7 @@ class Valves(BaseModel):
     public_key: str                         # Langfuse public key
     host: str                               # Langfuse host URL
     insert_tags: bool = True                # Add task names as Langfuse tags
-    use_model_name_instead_of_id: bool = False  # Use human name in generations
-    redact_content: bool = True             # Replace content with size summaries
-    debug: bool = False                     # Enable debug logging
+    use_model_name_instead_of_id_for_generation: bool = False  # Use human name in generations
 ```
 
 Valves are initialised from environment variables at startup and can be changed at runtime via the OpenWebUI admin panel. When changed, `on_valves_updated()` is called, which reinitialises the Langfuse client.

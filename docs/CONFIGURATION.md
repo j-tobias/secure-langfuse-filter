@@ -17,8 +17,6 @@ Valves are defined in `Pipeline.Valves` (Pydantic `BaseModel`) and can be edited
 | `host` | `str` | `"https://cloud.langfuse.com"` | `LANGFUSE_HOST` | Langfuse API host URL. Change for self-hosted instances. |
 | `insert_tags` | `bool` | `True` | — | When `True`, adds `"open-webui"` tag to every trace and appends the task name (e.g., `"title_generation"`) for non-default tasks. |
 | `use_model_name_instead_of_id_for_generation` | `bool` | `False` | `USE_MODEL_NAME` | When `True`, uses the human-readable model name (e.g., `"Llama 3.1 (8B)"`) instead of the model ID (e.g., `"llama3.1:latest"`) in generation observations. |
-| `redact_content` | `bool` | `True` | — | When `True`, replaces all message content with metadata summaries (`[REDACTED | N chars | M words | ~T tokens]`). When `False`, full message text is sent to Langfuse. **Strongly recommended to keep enabled for privacy.** |
-| `debug` | `bool` | `False` | `DEBUG_MODE` | Enables debug logging to the server console. Logs are sanitised — no PII or message content is printed. |
 
 ### Environment Variables
 
@@ -32,7 +30,6 @@ LANGFUSE_PUBLIC_KEY=pk-lf-...
 # Optional
 LANGFUSE_HOST=https://langfuse.example.com   # default: https://cloud.langfuse.com
 USE_MODEL_NAME=true                           # default: false
-DEBUG_MODE=true                               # default: false
 ```
 
 ---
@@ -51,7 +48,6 @@ These are **class-level constants** defined directly in `Pipeline`. They are not
 1. Every `inlet()` call checks if `_CLEANUP_INTERVAL_SECONDS` has elapsed since the last cleanup
 2. If yes, scans `chat_last_seen` for entries older than `_CHAT_TTL_SECONDS`
 3. For each stale chat:
-   - Ends the Langfuse root span/trace
    - Removes entries from `chat_traces`, `model_names`, `inlet_timestamps`, `chat_enrichments`, `chat_last_seen`
 4. Flushes pending Langfuse data after cleanup
 
@@ -69,12 +65,11 @@ The filter maintains per-chat state in instance dictionaries. Understanding thes
 
 | Dict | Key | Value | Lifecycle |
 |------|-----|-------|-----------|
-| `chat_traces` | `chat_id` | Root Langfuse span object | Created in `inlet()`, ended in `on_shutdown()` or cleanup |
+| `chat_traces` | `chat_id` | Root Langfuse trace object | Created in `inlet()`, cleared in `on_shutdown()` or cleanup |
 | `model_names` | `chat_id` | `{"model_id": "...", "model_name": "..."}` | Set in `inlet()`, read in `outlet()` |
 | `inlet_timestamps` | `chat_id` | `float` (epoch seconds) | Set in `inlet()`, popped in `outlet()` for response time |
 | `chat_enrichments` | `chat_id` | `{"chat_title": "...", "chat_tags": "..."}` | Built up from `title_generation` / `tags_generation` task outlets |
 | `chat_last_seen` | `chat_id` | `float` (epoch seconds) | Updated in `inlet()`, used by cleanup to determine staleness |
-| `suppressed_logs` | — | `set` of message strings | Prevents repeated debug log messages |
 
 ---
 
@@ -83,10 +78,10 @@ The filter maintains per-chat state in instance dictionaries. Understanding thes
 | Hook | When it fires | What the filter does |
 |------|--------------|---------------------|
 | `on_startup()` | OpenWebUI starts, pipeline loads | Calls `set_langfuse()` to initialise the Langfuse client |
-| `on_shutdown()` | OpenWebUI stops, pipeline unloads | Ends all active traces, clears all state, flushes to Langfuse |
+| `on_shutdown()` | OpenWebUI stops, pipeline unloads | Flushes pending data to Langfuse, clears all state |
 | `on_valves_updated()` | User saves valve changes in the UI | Calls `set_langfuse()` to reinitialise with new credentials/host |
-| `inlet(body, user)` | Before each LLM request | Records timing, creates/reuses trace, logs user input |
-| `outlet(body, user)` | After each LLM response | Captures enrichments, logs generation, calculates response time |
+| `inlet(body, user)` | Before each LLM request | Records timing, stores model info, creates trace on first message |
+| `outlet(body, user)` | After each LLM response | Captures enrichments, creates generation, calculates response time |
 
 ---
 
@@ -97,5 +92,4 @@ The filter maintains per-chat state in instance dictionaries. Understanding thes
    - `secret_key`: Your Langfuse secret key
    - `public_key`: Your Langfuse public key
    - `host`: Your Langfuse instance URL (or keep the default for cloud)
-3. **Leave defaults** for everything else — `redact_content=True` and `insert_tags=True` are the recommended privacy settings
-4. **Enable debug** temporarily if traces aren't appearing, then disable once verified
+3. **Leave defaults** for everything else — `insert_tags=True` is the recommended setting. No message content is ever sent to Langfuse.

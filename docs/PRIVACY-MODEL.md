@@ -13,7 +13,7 @@ This document describes the filter's approach to anonymising usage telemetry bef
 | Model ID / name | `llama3.1:latest` | Track model usage |
 | Token counts | `{input: 45, output: 28}` | Monitor resource consumption |
 | Response time | `1234.5` ms | Performance monitoring |
-| Content summaries | `[REDACTED \| 523 chars \| 98 words \| ~131 tokens]` | Understand message size without seeing content |
+| Message stats | `{message_count: 3, roles: [...], input_chars: 480, estimated_input_tokens: 120}` | Understand message structure/size without seeing content |
 | Tags | `["open-webui", "title_generation"]` | Categorise trace types |
 | Chat title | `"Math Questions"` | Browsable trace names *(see note below)* |
 | Chat tags | `"math, arithmetic"` | Topic classification *(see note below)* |
@@ -32,15 +32,15 @@ This document describes the filter's approach to anonymising usage telemetry bef
 | Display name | `metadata.user.display_name` | Stripped by `_sanitize_metadata()` |
 | Avatar URL | `metadata.user.profile_image_url` | Stripped by `_sanitize_metadata()` |
 | User location | `metadata.variables.{{USER_LOCATION}}` | Stripped by `_is_pii_variable()` |
-| Message content | `body.messages[].content` | Replaced by `_redact_text()` summary |
-| Image data | `content[].image_url.url` | Replaced with `[REDACTED image]` |
+| Message content | `body.messages[].content` | **Never sent** — only `len()` and word counts are computed; the text itself is discarded |
+| Image data | `content[].image_url.url` | Never sent — only text-type parts are measured for char/word counts |
 | Raw user object | `body.user`, `user` param | Never forwarded; only `_hash_user_id(email)` is used |
 
 ---
 
 ## Sanitisation Layers
 
-The filter applies **five layers** of sanitisation, each addressing a different attack surface:
+The filter applies **three layers** of sanitisation, each addressing a different attack surface:
 
 ### Layer 1 — User Identity Hashing
 
@@ -94,46 +94,23 @@ metadata.variables = {
 }
 ```
 
-### Layer 3 — Body PII Stripping
+### Layer 3 — Content Exclusion
 
-Operates on the top-level `body` dict. Same approach as Layer 2's exact matching but applied to body keys:
-
-```python
-_sanitize_body_pii_keys = {
-    "user", "user_id", "user_email", "user_name",
-    "name", "email", "profile_image_url", "avatar",
-}
-```
-
-This catches any user-identifiable fields that OpenWebUI places directly in the body (not nested in metadata).
-
-### Layer 4 — Content Redaction
-
-When `redact_content=True` (default), all message text is replaced with a metadata summary:
-
-```
-"What is the capital of France?" → "[REDACTED | 32 chars | 7 words | ~8 tokens]"
-```
-
-Handles three content formats:
-
-| Format | Example | Redaction |
-|--------|---------|-----------|
-| Plain text | `"content": "Hello"` | `"content": "[REDACTED \| 5 chars \| 1 words \| ~1 tokens]"` |
-| Multi-modal list | `[{"type": "text", "text": "..."}, {"type": "image_url", ...}]` | Text parts redacted, image URLs replaced with `[REDACTED image]` |
-| Other | Any non-string, non-list content | Cast to string, then redacted |
-
-Structural metadata is always preserved: `role`, `tool_calls`, `name` (function names in tool calls, not user names).
-
-### Layer 5 — Debug Log Sanitisation
-
-Even debug logs are sanitised. The outlet function logs only:
+**No message content is ever sent to Langfuse.** The filter reads message content only to compute aggregate statistics:
 
 ```python
-self.log(f"Outlet called for chat_id={chat_id}, model={model_id}, messages={len(messages)}")
+@staticmethod
+def _message_stats(messages: list) -> dict:
+    # Reads content ONLY for len() — text is never stored
+    return {
+        "message_count": len(messages),
+        "roles": roles,
+        "input_chars": total_chars,
+        "estimated_input_tokens": max(1, total_chars // 4),
+    }
 ```
 
-**Not** the full body, which would leak message content into server logs.
+This is fundamentally different from redaction (replacing text with `[REDACTED | ...]`). With content exclusion, the body is never copied, body content is never serialised, and no text — redacted or otherwise — appears anywhere in Langfuse.
 
 ---
 
@@ -141,10 +118,8 @@ self.log(f"Outlet called for chat_id={chat_id}, model={model_id}, messages={len(
 
 A critical design constraint: **the filter never mutates the `body` dict**.
 
-Earlier versions wrote sanitised data back into `body.metadata`, which caused OpenWebUI errors (e.g., overwriting `chat_id` broke session matching). The current design:
-
 1. **Reads** from `body` and `body.metadata` to extract operational data
-2. Creates **separate copies** (`safe_metadata`, `safe_body`) for Langfuse
+2. Computes **summary dicts** (counts, roles, tokens) from messages — no text stored
 3. Returns the **original, unmodified** `body` to OpenWebUI
 
 This ensures the filter is invisible to the rest of the pipeline.
@@ -156,16 +131,15 @@ This ensures the filter is invisible to the rest of the pipeline.
 | Threat | Mitigation |
 |--------|-----------|
 | Langfuse admin sees user emails | Emails are SHA-256 hashed; only the hash is stored |
-| Langfuse data breach exposes conversations | Content is redacted; only size summaries are stored |
-| Metadata contains user PII | 3 sanitisation layers strip known PII keys |
+| Langfuse data breach exposes conversations | No message content is sent — only counts and metadata |
+| Metadata contains user PII | 2 sanitisation layers strip known PII keys |
 | New metadata keys contain PII | Substring matching catches keys containing `user`, `name`, `email`, etc. |
-| Debug logs leak content | Outlet logs only chat_id, model, and message count |
-| Filter modifies request and breaks OpenWebUI | Body is never mutated; separate copies used for Langfuse |
+| Filter modifies request and breaks OpenWebUI | Body is never mutated; summary dicts computed separately |
 | Long-running server accumulates user data in memory | TTL-based cleanup evicts state after 24 hours of inactivity |
 
 ### Known Limitations
 
 1. **Chat titles and tags** are forwarded as-is. If the LLM generates a title like "Alice's tax questions", this is visible in Langfuse. The user can disable enrichment capture if this is a concern.
-2. **Token heuristic** (`len(text) // 4`) is approximate. Actual token counts from the model are used when available; the heuristic only appears in redaction summaries.
+2. **Token heuristic** (`len(text) // 4`) is approximate. Actual token counts from the model are used when available; the heuristic only appears in message summaries.
 3. **SHA-256 without salt** means the same email always maps to the same hash. An attacker with a list of candidate emails could hash them to find matches. For most use cases this is acceptable; add a secret salt to `_hash_user_id()` if your threat model requires it.
 4. **Model names** are sent in full. If your model names contain sensitive information (e.g., custom fine-tune names with client identifiers), consider scrubbing them.
